@@ -1,6 +1,7 @@
 """Web-Dashboard:  streamlit run dashboard/app.py"""
 from __future__ import annotations
 
+import base64
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -13,8 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tradebots import config  # noqa: E402
 
 LABELS = {"wsb": "WallStreetBets", "truth": "Truth Social", "armstrong": "Armstrong Economics", "SPY": "SPY (Benchmark)"}
+FAVICON_PATH = Path(__file__).resolve().parent / "favicon.ico"
 
-st.set_page_config(page_title="Tradingbot-Vergleich", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="Tradingbot-Vergleich",
+    page_icon=str(FAVICON_PATH) if FAVICON_PATH.exists() else None,
+    layout="wide",
+)
 
 
 def q(sql: str, params=()) -> pd.DataFrame:
@@ -47,9 +53,19 @@ def max_drawdown(eq: pd.Series) -> float:
         return 0.0
     return float((eq / eq.cummax() - 1).min())
 
+if FAVICON_PATH.exists():
+    icon_b64 = base64.b64encode(FAVICON_PATH.read_bytes()).decode("ascii")
+    st.markdown(
+        f"""<div style="display:flex;align-items:center;gap:14px;margin-bottom:0.5rem;">
+            <img src="data:image/x-icon;base64,{icon_b64}" width="40" height="40" alt="Logo" />
+            <h1 style="margin:0;padding:0;">Tradingbot-Vergleich (Paper Trading)</h1>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+else:
+    st.title("Tradingbot-Vergleich (Paper Trading)")
 
-st.title("📈 Tradingbot-Vergleich (Paper Trading)")
-if st.button("🔄 Aktualisieren"):
+if st.button("Aktualisieren", icon=":material/refresh:"):
     st.cache_data.clear()
 
 snaps = q("SELECT * FROM snapshots ORDER BY ts")

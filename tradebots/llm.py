@@ -13,10 +13,14 @@ from . import config
 log = logging.getLogger("llm")
 
 BASE_PROMPT = """You are a disciplined trading-signal extractor for a PAPER-TRADING research experiment.
-You receive a batch of posts from ONE data source. Decide which US-listed stocks/ETFs (tradable on NYSE/NASDAQ/ARCA)
-are likely to move because of what these posts say, over the next few days.
+You receive CONTEXT (your current portfolio, recent market prices, your recent signals, and previous posts from this source)
+plus a batch of NEW POSTS from ONE data source. Decide which US-listed stocks/ETFs (tradable on NYSE/NASDAQ/ARCA)
+are likely to move because of what the NEW POSTS say, over the next few days.
 
 Rules:
+- Base new signals on the NEW POSTS; use previous posts only to spot trends, escalations, or shifts in tone (do not re-trigger on old posts alone).
+- Use the current portfolio: if new posts turn bearish on a held position or invalidate its thesis, emit a "sell" signal. Avoid duplicate "buy" signals for positions already held.
+- Use recent market prices to avoid chasing tickers that already rallied heavily without a fresh catalyst.
 - Use only tickers that really exist on US exchanges. Use plain symbols (e.g. "AAPL", "GLD"). No options, no crypto pairs.
 - "buy" = expect price to rise. "sell" = expect price to fall (the bot will only exit/avoid, it does not short).
 - confidence is 0.0-1.0. Be conservative: most posts are noise; >0.8 only for very clear, strong signals.
@@ -101,7 +105,7 @@ def _parse_json(text: str) -> dict:
         return json.loads(m.group(0))
 
 
-def analyze(bot: str, items: list[dict], universe: list[str]) -> list[dict]:
+def analyze(bot: str, items: list[dict], universe: list[str], context: str = "") -> list[dict]:
     """Gibt validierte Signale zurueck (ohne Tradable-Check, der passiert im Broker)."""
     if not items:
         return []
@@ -113,7 +117,11 @@ def analyze(bot: str, items: list[dict], universe: list[str]) -> list[dict]:
     for it in items:
         body = (it.get("text") or "")[:1800]
         lines.append(f"--- post_id={it['item_id']} | {it.get('created_utc','')} | {it.get('author','')}\nTITLE: {it.get('title','')}\n{body}")
-    user = "Posts:\n\n" + "\n\n".join(lines)
+    parts = []
+    if context:
+        parts.append("=== CONTEXT ===\n" + context)
+    parts.append("=== NEW POSTS TO ANALYZE ===\n" + "\n\n".join(lines))
+    user = "\n\n".join(parts)
 
     data, model = _chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],

@@ -84,6 +84,18 @@ def mark_analyzed(bot: str, item_ids: list[str], value: int = 1) -> None:
         c.executemany("UPDATE items SET analyzed=? WHERE bot=? AND item_id=?", [(value, bot, i) for i in item_ids])
 
 
+def recent_items(bot: str, limit: int = 12, exclude_ids: set[str] | None = None) -> list[sqlite3.Row]:
+    """Letzte bereits ausgewertete Posts dieses Bots als Gedaechtnis."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT item_id, created_utc, author, title, text FROM items WHERE bot=? AND analyzed=1 ORDER BY created_utc DESC LIMIT ?",
+            (bot, limit + len(exclude_ids or ())),
+        ).fetchall()
+    if exclude_ids:
+        rows = [r for r in rows if r["item_id"] not in exclude_ids]
+    return rows[:limit]
+
+
 # ---------- signals ----------
 def insert_signal(bot: str, s: dict, source_items: list[str]) -> int:
     with conn() as c:
@@ -111,6 +123,15 @@ def expire_signals(bot: str, ttl_hours: int) -> None:
 def pending_signals(bot: str) -> list[sqlite3.Row]:
     with conn() as c:
         return c.execute("SELECT * FROM signals WHERE bot=? AND status='pending' ORDER BY created_at", (bot,)).fetchall()
+
+
+def recent_signals(bot: str, limit: int = 12) -> list[sqlite3.Row]:
+    """Letzte Signale dieses Bots (unabhaengig vom Status) als Historie."""
+    with conn() as c:
+        return c.execute(
+            "SELECT created_at, ticker, action, confidence, status, reason FROM signals WHERE bot=? ORDER BY id DESC LIMIT ?",
+            (bot, limit),
+        ).fetchall()
 
 
 # ---------- trades / snapshots ----------

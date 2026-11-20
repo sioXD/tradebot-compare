@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import math
-from functools import lru_cache
+from datetime import datetime, timedelta, timezone
 
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetStatus, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
@@ -50,6 +51,31 @@ class Broker:
     def latest_price(self, symbol: str) -> float:
         r = self.data.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))
         return float(r[symbol].price)
+
+    def market_summary(self, symbols: list[str]) -> dict[str, dict]:
+        """Liefert letzten Schlusskurs sowie 1-Tages- und 5-Tages-Veraenderung fuer eine Liste von Tickern."""
+        syms = list(dict.fromkeys(s.upper() for s in symbols if s))[:25]
+        if not syms:
+            return {}
+        try:
+            start = datetime.now(timezone.utc) - timedelta(days=12)
+            bars = self.data.get_stock_bars(
+                StockBarsRequest(symbol_or_symbols=syms, timeframe=TimeFrame.Day, start=start, feed="iex")
+            )
+            out: dict[str, dict] = {}
+            for sym in syms:
+                series = bars.data.get(sym, [])
+                if not series:
+                    continue
+                closes = [float(b.close) for b in series]
+                last = closes[-1]
+                chg_1d = (last / closes[-2] - 1) if len(closes) >= 2 else 0.0
+                ref_5d = closes[-6] if len(closes) >= 6 else closes[0]
+                chg_5d = (last / ref_5d - 1) if ref_5d else 0.0
+                out[sym] = {"price": last, "chg_1d": chg_1d, "chg_5d": chg_5d}
+            return out
+        except Exception:  # noqa: BLE001
+            return {}
 
     def buy_notional(self, symbol: str, notional: float):
         """Kauft fuer ~notional USD. Fractional wenn moeglich, sonst ganze Stueck."""

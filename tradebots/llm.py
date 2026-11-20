@@ -1,0 +1,161 @@
+"""LLM-basierte Signal-Extraktion ueber eine OpenAI-kompatible API (z.B. OpenCode Zen)."""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+
+from openai import OpenAI
+
+from . import config
+
+log = logging.getLogger("llm")
+
+BASE_PROMPT = """You are a disciplined trading-signal extractor for a PAPER-TRADING research experiment.
+You receive a batch of posts from ONE data source. Decide which US-listed stocks/ETFs (tradable on NYSE/NASDAQ/ARCA)
+are likely to move because of what these posts say, over the next few days.
+
+Rules:
+- Use only tickers that really exist on US exchanges. Use plain symbols (e.g. "AAPL", "GLD"). No options, no crypto pairs.
+- "buy" = expect price to rise. "sell" = expect price to fall (the bot will only exit/avoid, it does not short).
+- confidence is 0.0-1.0. Be conservative: most posts are noise; >0.8 only for very clear, strong signals.
+- horizon_days: expected holding period in trading days (1-30).
+- reason: max. 25 words, in German, referencing the post(s).
+- If nothing is actionable, return an empty list.
+- Respond with ONLY a JSON object, no markdown: {"signals":[{"ticker":"...","action":"buy|sell","confidence":0.0,"horizon_days":3,"reason":"...","post_ids":["..."]}]}
+"""
+
+SOURCE_HINTS = {
+    "wsb": """Source: Reddit r/wallstreetbets. Either raw hot/rising posts (with score/comment counts) OR an aggregated
+snapshot of ticker mention counts (mentions now vs. 24h ago, upvotes, rank change).
+Focus on tickers with strong, broad community conviction (many upvotes/comments, multiple posts, sharply rising mentions).
+For mention snapshots: a strong surge in mentions/rank suggests short-term momentum (buy); a collapse in attention after a hype
+suggests fading (sell). Broad index ETFs (SPY, QQQ) are discussed constantly - only signal them on extreme changes.
+Ignore memes without a ticker, loss/gain porn without forward-looking view, and penny stocks under ~$2.""",
+    "truth": """Source: Truth Social posts by Donald J. Trump.
+Identify concrete market implications: named companies, sectors (tariffs, defense, energy, pharma, autos, chips, crypto),
+policy announcements. Map them to the most directly affected liquid US stocks or sector ETFs (e.g. XLE, ITA, SMH, XLV).
+Ignore purely political posts without economic content.""",
+    "armstrong": """Source: Martin Armstrong's blog (armstrongeconomics.com) - macro/cycle analysis.
+Translate macro views (equities, gold, bonds/interest rates, dollar, euro, oil, emerging markets) into positions in the
+ALLOWED UNIVERSE only. Longer horizons (5-30 days) are typical. Only signal when the post states a directional view.""",
+}
+
+
+def _client() -> OpenAI:
+    if not config.LLM_API_KEY or not config.LLM_MODELS:
+        raise RuntimeError("LLM_API_KEY und LLM_MODEL muessen in .env gesetzt sein")
+    return OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY, timeout=120, max_retries=1)
+
+
+# Modell -> Zeitpunkt, bis zu dem es pausiert wird (nach Limit-/Guthaben-Fehler)
+_cooldown_until: dict[str, float] = {}
+_LIMIT_HINTS = ("quota", "limit", "credit", "balance", "insufficient", "exhausted", "billing", "payment")
+
+
+def _is_limit_error(e: Exception) -> bool:
+    status = getattr(e, "status_code", None)
+    if status in (402, 403, 429):
+        return True
+    return any(h in str(e).lower() for h in _LIMIT_HINTS)
+
+
+def _chat(messages: list[dict], parse_json: bool, **kw):
+    """Probiert die Modelle der Reihe nach. Ein Modell, das an ein Limit stoesst,
+    wird fuer LLM_COOLDOWN_MINUTES pausiert und danach automatisch wieder bevorzugt."""
+    client = _client()
+    errors = []
+    now = time.time()
+    candidates = [m for m in config.LLM_MODELS if _cooldown_until.get(m, 0) <= now] or config.LLM_MODELS[-1:]
+    for model in candidates:
+        try:
+            resp = client.chat.completions.create(model=model, messages=messages, **kw)
+            text = resp.choices[0].message.content or ""
+            result = _parse_json(text or "{}") if parse_json else text
+            if model != config.LLM_MODELS[0]:
+                log.info("LLM-Fallback genutzt: %s", model)
+            return result, model
+        except json.JSONDecodeError as e:
+            errors.append(f"{model}: ungueltiges JSON")  # Modell lieferte Murks -> naechstes probieren
+            log.warning("%s lieferte kein gueltiges JSON: %s", model, e)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{model}: {e}")
+            if _is_limit_error(e):
+                _cooldown_until[model] = time.time() + config.LLM_COOLDOWN_MINUTES * 60
+                log.warning("%s am Limit -> %d min Pause, wechsle Modell", model, config.LLM_COOLDOWN_MINUTES)
+            else:
+                log.warning("%s Fehler: %s", model, e)
+    raise RuntimeError("Alle LLM-Modelle fehlgeschlagen: " + " | ".join(errors))
+
+
+def _parse_json(text: str) -> dict:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not m:
+            raise
+        return json.loads(m.group(0))
+
+
+def analyze(bot: str, items: list[dict], universe: list[str]) -> list[dict]:
+    """Gibt validierte Signale zurueck (ohne Tradable-Check, der passiert im Broker)."""
+    if not items:
+        return []
+    system = BASE_PROMPT + "\n" + SOURCE_HINTS[bot]
+    if universe:
+        system += f"\nALLOWED UNIVERSE (use ONLY these tickers): {', '.join(universe)}"
+
+    lines = []
+    for it in items:
+        body = (it.get("text") or "")[:1800]
+        lines.append(f"--- post_id={it['item_id']} | {it.get('created_utc','')} | {it.get('author','')}\nTITLE: {it.get('title','')}\n{body}")
+    user = "Posts:\n\n" + "\n\n".join(lines)
+
+    data, model = _chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        parse_json=True,
+        temperature=0.1,
+    )
+    if not isinstance(data, dict):
+        data = {}
+
+    out = []
+    for s in data.get("signals", []):
+        try:
+            ticker = str(s["ticker"]).upper().strip().lstrip("$")
+            action = str(s["action"]).lower().strip()
+            conf = max(0.0, min(1.0, float(s.get("confidence", 0))))
+        except (KeyError, ValueError, TypeError):
+            continue
+        if action not in ("buy", "sell") or not re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", ticker):
+            continue
+        if universe and ticker not in universe:
+            continue
+        out.append(
+            dict(
+                ticker=ticker,
+                action=action,
+                confidence=conf,
+                horizon_days=int(s.get("horizon_days") or 3),
+                reason=str(s.get("reason", ""))[:500],
+                post_ids=[str(p) for p in s.get("post_ids", [])],
+            )
+        )
+    return out
+
+
+def ping() -> str:
+    """Testet JEDES konfigurierte Modell einzeln."""
+    client = _client()
+    out = []
+    for m in config.LLM_MODELS:
+        try:
+            r = client.chat.completions.create(model=m, messages=[{"role": "user", "content": "Antworte nur mit: OK"}])
+            out.append(f"{m}='{(r.choices[0].message.content or '').strip()}'")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"{m}=FEHLER({str(e)[:120]})")
+    return ", ".join(out)

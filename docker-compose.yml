@@ -1,0 +1,23 @@
+x-bot: &bot
+  build: .
+  image: tradebot-compare
+  env_file: .env
+  volumes:
+    - ./data:/app/data
+  restart: unless-stopped   # startet automatisch, wenn der Server morgens hochfaehrt
+
+services:
+  bot-wsb:
+    <<: *bot
+    command: python -m tradebots.runner wsb
+  bot-truth:
+    <<: *bot
+    command: python -m tradebots.runner truth
+  bot-armstrong:
+    <<: *bot
+    command: python -m tradebots.runner armstrong
+  dashboard:
+    <<: *bot
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "8501:8501"

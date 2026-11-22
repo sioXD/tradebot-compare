@@ -27,8 +27,11 @@ st.set_page_config(
 def q(sql: str, params=()) -> pd.DataFrame:
     if not config.DB_PATH.exists():
         return pd.DataFrame()
-    with sqlite3.connect(config.DB_PATH, timeout=30) as c:
-        return pd.read_sql_query(sql, c, params=params)
+    try:
+        with sqlite3.connect(f"file:{config.DB_PATH}?mode=ro", uri=True, timeout=30) as c:
+            return pd.read_sql_query(sql, c, params=params)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600)
@@ -74,16 +77,79 @@ if not snaps.empty:
     snaps["ts"] = pd.to_datetime(snaps["ts"], utc=True)
 trades = q("SELECT * FROM trades ORDER BY ts DESC")
 
-# Startzeitpunkt des Experiments: EXPERIMENT_START (.env, z.B. 2026-11-20) > erster Snapshot > vor 30 Tagen
+# Warnbanner, falls ein Bot wegen Fremd-Order pausiert wurde
+recent_ev = q("SELECT bot, ts, level, message FROM events ORDER BY id DESC LIMIT 50")
+if not recent_ev.empty:
+    for bot in config.BOT_NAMES:
+        bev = recent_ev[recent_ev.bot == bot]
+        for _, row in bev.iterrows():
+            msg = str(row["message"] or "")
+            if msg.startswith("Bot gestartet"):
+                break
+            if "HANDEL PAUSIERT" in msg:
+                st.warning(f"**{LABELS[bot]}**: {msg}")
+                break
+
+
+@st.cache_data(ttl=300)
+def alpaca_orders(bot: str) -> pd.DataFrame:
+    """Ausgefuehrte Orders direkt von Alpaca (ueberlebt leere/neue lokale DB)."""
+    try:
+        from tradebots.broker import Broker
+
+        cfg = config.bot_config(bot)
+        if not cfg.alpaca_key:
+            return pd.DataFrame()
+        rows = []
+        for o in Broker(cfg).filled_orders():
+            qty, px = float(o.filled_qty or 0), float(o.filled_avg_price or 0)
+            side = o.side.value if hasattr(o.side, "value") else str(o.side)
+            ts = (o.filled_at or o.submitted_at)
+            rows.append(
+                {
+                    "bot": bot,
+                    "ts": ts.isoformat(timespec="seconds") if ts else "",
+                    "ticker": o.symbol,
+                    "side": side,
+                    "notional": round(qty * px, 2),
+                    "order_id": str(o.id),
+                    "reason": "Alpaca-Order",
+                }
+            )
+        return pd.DataFrame(rows)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+
+
+# Fehlende Alpaca-Orders fuer die Anzeige ergaenzen (falls DB frisch/unvollstaendig)
+extra_trades = []
+existing_oids = set(trades["order_id"].dropna().astype(str)) if not trades.empty and "order_id" in trades else set()
+for bot in config.BOT_NAMES:
+    ao = alpaca_orders(bot)
+    if not ao.empty:
+        missing = ao[~ao["order_id"].isin(existing_oids)]
+        if not missing.empty:
+            extra_trades.append(missing)
+if extra_trades:
+    trades = pd.concat([trades] + extra_trades, ignore_index=True).sort_values("ts", ascending=False)
+
+# Startzeitpunkt des Experiments: EXPERIMENT_START (.env) > fruehester Snapshot/Trade (inkl. Alpaca) > vor 30 Tagen
 _start_env = os.getenv("EXPERIMENT_START", "").strip()
+START = None
 if _start_env:
-    START = pd.Timestamp(_start_env, tz="UTC")
-elif not snaps.empty:
-    START = snaps["ts"].min().normalize()
-elif not trades.empty:
-    START = pd.to_datetime(trades["ts"], utc=True).min().normalize()
-else:
-    START = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=30)
+    try:
+        START = pd.Timestamp(_start_env, tz="UTC")
+    except Exception:  # noqa: BLE001
+        st.warning(f"Ungueltiges EXPERIMENT_START in .env ('{_start_env}') – nutze automatisches Startdatum.")
+if START is None:
+    candidates = []
+    if not snaps.empty:
+        candidates.append(snaps["ts"].min().normalize())
+    if not trades.empty:
+        t_min = pd.to_datetime(trades["ts"], utc=True, errors="coerce").min()
+        if pd.notna(t_min):
+            candidates.append(t_min.normalize())
+    START = min(candidates) if candidates else (pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=30))
 
 
 @st.cache_data(ttl=300)
@@ -114,6 +180,7 @@ def alpaca_account(bot: str) -> dict:
 
 
 # ---- Performance-Kurve (in % seit Start) ----
+now_ts = pd.Timestamp.now(tz="UTC").floor("min")
 curves = {}
 summary = []
 for bot in config.BOT_NAMES:
@@ -126,7 +193,8 @@ for bot in config.BOT_NAMES:
         continue
     acct = alpaca_account(bot)
     if acct:  # aktuellen Stand anhaengen, damit die Kurve bis "jetzt" reicht
-        s = pd.concat([s, pd.Series({pd.Timestamp.now(tz="UTC"): acct["equity"]})])
+        s = pd.concat([s, pd.Series({now_ts: acct["equity"]})])
+    s = s[~s.index.duplicated(keep="last")].sort_index()
     curves[LABELS[bot]] = (s / s.iloc[0] - 1) * 100
     n_trades = int((trades.bot == bot).sum()) if not trades.empty else 0
     last = snaps[snaps.bot == bot].iloc[-1] if not snaps.empty and (snaps.bot == bot).any() else None

@@ -108,8 +108,20 @@ def _max_drawdown(values: list[float]) -> float:
     return worst * 100.0
 
 
+def _rows_safe(sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+    """Wie _rows, gibt aber [] zurueck, wenn die DB fehlt oder leer ist."""
+    if not DB_PATH.exists():
+        return []
+    try:
+        with _connect() as con:
+            con.row_factory = sqlite3.Row
+            return list(con.execute(sql, params))
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _bot_summary(bot: str) -> dict[str, Any]:
-    snaps = _rows(
+    snaps = _rows_safe(
         "SELECT ts, equity, cash, positions_value, n_positions "
         "FROM snapshots WHERE bot=? ORDER BY ts",
         (bot,),
@@ -132,7 +144,8 @@ def _bot_summary(bot: str) -> dict[str, Any]:
     else:
         equity, first, last, ret, end, last_dt = [], None, None, 0.0, 0.0, None
 
-    trade_count = _rows("SELECT COUNT(*) AS n FROM trades WHERE bot=?", (bot,))[0]["n"]
+    trade_rows = _rows_safe("SELECT COUNT(*) AS n FROM trades WHERE bot=?", (bot,))
+    trade_count = int(trade_rows[0]["n"]) if trade_rows else 0
     now = datetime.now(timezone.utc)
     if perf:  # Alpaca ist die Quelle der Wahrheit
         last_dt = now
@@ -145,7 +158,7 @@ def _bot_summary(bot: str) -> dict[str, Any]:
         "equity": round(end, 2),
         "return_pct": round(ret, 2),
         "max_drawdown_pct": round(_max_drawdown(equity), 2) if equity else 0.0,
-        "trades": int(trade_count),
+        "trades": trade_count,
         "open_positions": int(last["n_positions"] or 0) if last else 0,
         "cash": round(float(last["cash"] or 0), 2) if last else 0.0,
         "since": (first["ts"] or "")[:10] if first else "",
@@ -166,19 +179,22 @@ _PERF_TTL = 300  # Sekunden – schont die Alpaca-API, Widget fragt eh nur alle 
 SPARK_POINTS = 90
 
 
-def _experiment_start() -> datetime:
+def _experiment_start(earliest_order: datetime | None = None) -> datetime:
     env = os.getenv("EXPERIMENT_START", "").strip()
     if env:
         dt = _iso(env)
         if dt:
             return dt
+    candidates: list[datetime] = []
     for sql in ("SELECT MIN(ts) AS t FROM snapshots", "SELECT MIN(ts) AS t FROM trades"):
-        try:
-            t = _iso(_rows(sql)[0]["t"])
-        except HTTPException:
-            t = None
+        rows = _rows_safe(sql)
+        t = _iso(rows[0]["t"]) if rows else None
         if t:
-            return t.replace(hour=0, minute=0, second=0, microsecond=0)
+            candidates.append(t.replace(hour=0, minute=0, second=0, microsecond=0))
+    if earliest_order:
+        candidates.append(earliest_order.replace(hour=0, minute=0, second=0, microsecond=0))
+    if candidates:
+        return min(candidates)
     return datetime.now(timezone.utc) - timedelta(days=30)
 
 
@@ -224,8 +240,12 @@ def _performance(bot: str) -> dict[str, Any] | None:
         from tradebots.config import bot_config
 
         broker = Broker(bot_config(bot))
-        points = broker.equity_history(_experiment_start())
+        orders = broker.filled_orders()
+        order_times = [o.filled_at or o.submitted_at for o in orders if (o.filled_at or o.submitted_at)]
+        earliest_order = min(order_times) if order_times else None
+        points = broker.equity_history(_experiment_start(earliest_order))
         acct = broker.account()
+        n_pos = len(broker.positions())
         now_value = float(acct.equity)
         if points:
             first_t, first_v = points[0]
@@ -237,6 +257,8 @@ def _performance(bot: str) -> dict[str, Any] | None:
             result = {
                 "equity": round(now_value, 2),
                 "cash": round(float(acct.cash), 2),
+                "open_positions": n_pos,
+                "trades": len(orders),
                 "return_pct": round((now_value / first_v - 1.0) * 100.0, 2),
                 "max_drawdown_pct": round(_max_drawdown([v for _, v in series]), 2),
                 "since": first_t.date().isoformat(),

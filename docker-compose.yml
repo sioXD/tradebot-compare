@@ -16,8 +16,35 @@ services:
   bot-armstrong:
     <<: *bot
     command: python -m tradebots.runner armstrong
+
   dashboard:
     <<: *bot
-    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    # baseUrlPath: Streamlit laeuft unter https://sioxd.duckdns.org/trade/
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --server.baseUrlPath trade
     ports:
+      # Nur im LAN. Im Router NICHT freigeben – oeffentlich geht es ueber nginx (443).
       - "8501:8501"
+    networks:
+      default:
+        aliases:
+          - tradebot-dashboard
+
+  # Read-only JSON-API fuer das Scriptable-Widget auf dem iPad.
+  # Kein eigener Host-Port: nginx erreicht den Container ueber das Docker-Netz.
+  api:
+    <<: *bot
+    command: uvicorn api.app:app --host 0.0.0.0 --port 8000
+    networks:
+      default:
+        aliases:
+          - tradebot-api
+
+  # Login nur mit Passwort (Cookie-Session) fuer das Dashboard.
+  # Das Passwort ist derselbe API_TOKEN wie beim Widget.
+  auth:
+    <<: *bot
+    command: uvicorn api.auth:app --host 0.0.0.0 --port 8001
+    networks:
+      default:
+        aliases:
+          - tradebot-auth

@@ -135,12 +135,17 @@ def recent_signals(bot: str, limit: int = 12) -> list[sqlite3.Row]:
 
 
 # ---------- trades / snapshots ----------
-def insert_trade(bot: str, ticker: str, side: str, notional: float | None, qty: float | None, order_id: str, reason: str, signal_ids=None) -> None:
+def insert_trade(bot: str, ticker: str, side: str, notional: float | None, qty: float | None, order_id: str, reason: str, signal_ids=None, ts: datetime | None = None) -> None:
     with conn() as c:
         c.execute(
             "INSERT INTO trades(bot,ts,ticker,side,notional,qty,order_id,reason,signal_ids) VALUES (?,?,?,?,?,?,?,?,?)",
-            (bot, iso(), ticker, side, notional, qty, order_id, reason, json.dumps(signal_ids or [])),
+            (bot, iso(ts), ticker, side, notional, qty, order_id, reason, json.dumps(signal_ids or [])),
         )
+
+
+def has_trade(bot: str, order_id: str) -> bool:
+    with conn() as c:
+        return c.execute("SELECT 1 FROM trades WHERE bot=? AND order_id=? LIMIT 1", (bot, order_id)).fetchone() is not None
 
 
 def last_buy_ts(bot: str, ticker: str) -> datetime | None:

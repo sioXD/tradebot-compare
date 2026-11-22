@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from . import db, engine, llm
-from .broker import Broker
+from .broker import INSTANCE_ID, Broker
 from .config import BotConfig, bot_config
 from .sources import SOURCES
 
@@ -114,8 +114,27 @@ def main(bot: str) -> None:
     cfg = bot_config(bot)
     db.init()
     broker = Broker(cfg)
-    log.info("Bot gestartet: %s", cfg)
-    db.log_event(bot, "INFO", "Bot gestartet")
+    started_at = db.now()
+    log.info("Bot gestartet (Instanz '%s'): %s", INSTANCE_ID, cfg)
+    db.log_event(bot, "INFO", f"Bot gestartet (Instanz '{INSTANCE_ID}')")
+
+    paused = False
+
+    def sync() -> None:
+        nonlocal paused
+        foreign = engine.sync_orders(cfg, broker, started_at)
+        if foreign and not paused:
+            paused = True
+            msg = (f"HANDEL PAUSIERT: Auf diesem Alpaca-Konto wurden Orders erteilt, die nicht von Instanz "
+                   f"'{INSTANCE_ID}' stammen ({', '.join(foreign)}). Laeuft der Bot noch auf einem zweiten Rechner? "
+                   f"Andere Instanz stoppen und diesen Container neu starten.")
+            log.error(msg)
+            db.log_event(bot, "ERROR", msg)
+
+    try:
+        sync()  # Historie von Alpaca nachtragen (falls DB neu/unvollstaendig)
+    except Exception as e:  # noqa: BLE001
+        db.log_event(bot, "ERROR", f"Order-Sync: {e}")
 
     last_fetch = last_trade = last_snap = 0.0
     while True:
@@ -132,11 +151,15 @@ def main(bot: str) -> None:
             is_open = broker.is_open()
             if is_open and t - last_trade >= cfg.trade_check_minutes * 60:
                 last_trade = t
-                engine.manage_exits(cfg, broker)
-                engine.execute_signals(cfg, broker)
+                sync()
+                if not paused:
+                    engine.manage_exits(cfg, broker)
+                    engine.execute_signals(cfg, broker)
             snap_every = 15 * 60 if is_open else 60 * 60
             if t - last_snap >= snap_every:
                 last_snap = t
+                if not is_open:
+                    sync()
                 engine.snapshot(cfg, broker)
         except Exception as e:  # noqa: BLE001
             log.exception("Trading-Schritt fehlgeschlagen")

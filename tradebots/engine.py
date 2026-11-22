@@ -5,14 +5,33 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from . import db
-from .broker import Broker
+from .broker import Broker, is_own_order
 from .config import BotConfig
 
 log = logging.getLogger(__name__)
 REBUY_COOLDOWN = timedelta(hours=24)
+
+
+def sync_orders(cfg: BotConfig, broker: Broker, started_at: datetime) -> list[str]:
+    """Traegt alle ausgefuehrten Alpaca-Orders nach, die in der lokalen DB fehlen.
+    Gibt die Ticker fremder Orders zurueck, die NACH dem Start dieser Instanz erteilt wurden
+    (= eine andere Instanz oder ein Mensch handelt gerade auf diesem Konto)."""
+    foreign_now: list[str] = []
+    for o in broker.filled_orders():
+        oid = str(o.id)
+        if db.has_trade(cfg.name, oid):
+            continue
+        own = is_own_order(o.client_order_id)
+        qty, px = float(o.filled_qty or 0), float(o.filled_avg_price or 0)
+        side = o.side.value if hasattr(o.side, "value") else str(o.side)
+        note = "Von Alpaca nachgetragen" + ("" if own else " (Order stammt nicht von dieser Instanz)")
+        db.insert_trade(cfg.name, o.symbol, side, qty * px, qty, oid, note, ts=o.filled_at or o.submitted_at)
+        if not own and o.submitted_at and o.submitted_at > started_at:
+            foreign_now.append(f"{side.upper()} {o.symbol}")
+    return foreign_now
 
 
 def manage_exits(cfg: BotConfig, broker: Broker) -> None:

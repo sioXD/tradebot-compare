@@ -42,6 +42,21 @@ class Broker:
     def is_open(self) -> bool:
         return bool(self.trading.get_clock().is_open)
 
+    def minutes_since_open(self) -> float | None:
+        """Minuten seit US-Boersenoeffnung (09:30 New York), oder None falls geschlossen."""
+        clk = self.trading.get_clock()
+        if not clk.is_open:
+            return None
+        try:
+            from zoneinfo import ZoneInfo
+
+            ny = ZoneInfo("America/New_York")
+        except Exception:  # noqa: BLE001
+            ny = timezone(timedelta(hours=-5))
+        ts = clk.timestamp.astimezone(ny)
+        open_dt = ts.replace(hour=9, minute=30, second=0, microsecond=0)
+        return (ts - open_dt).total_seconds() / 60.0
+
     def account(self):
         return self.trading.get_account()
 

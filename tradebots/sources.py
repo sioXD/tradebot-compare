@@ -13,6 +13,24 @@ import requests
 from . import config
 
 _TAG_RE = re.compile(r"<[^>]+>")
+_TRUTH_MEDIA_RE = re.compile(r"^(?:Image|Video|Quote|Link|ReTruth)\s+post\s+from\s+", re.IGNORECASE)
+
+
+def is_junk_item(bot: str, item: dict) -> bool:
+    """Filtert offensichtlich inhaltsleere Posts (Medien-Platzhalter, Paywall-Teaser) vor dem LLM."""
+    title = (item.get("title") or "").strip()
+    text = (item.get("text") or "").strip()
+    if bot == "truth":
+        if _TRUTH_MEDIA_RE.match(title):
+            body = text.replace(title, "").strip()
+            if len(body) < 30:
+                return True
+        if not title and len(text) < 20:
+            return True
+    elif bot == "armstrong":
+        if title.upper().startswith("PRIVATE BLOG") and len(text) < 350:
+            return True
+    return False
 
 
 def _clean(s: str | None) -> str:
@@ -69,7 +87,8 @@ def fetch_wsb_apewisdom() -> list[dict]:
     url = "https://apewisdom.io/api/v1.0/filter/wallstreetbets/page/1"
     resp = requests.get(url, headers={"User-Agent": config.HTTP_USER_AGENT}, timeout=30)
     resp.raise_for_status()
-    rows = resp.json().get("results", [])[:40]
+    raw_rows = resp.json().get("results", [])
+    rows = [r for r in raw_rows if str(r.get("ticker") or "").upper() not in config.WSB_BLACKLIST][:40]
     now = datetime.now(timezone.utc)
     lines = []
     for r in rows:

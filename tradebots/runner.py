@@ -15,7 +15,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-from . import db, engine, llm
+from . import db, engine, llm, sources
 from .broker import INSTANCE_ID, Broker
 from .config import BotConfig, bot_config
 from .sources import SOURCES
@@ -40,9 +40,11 @@ def build_context(cfg: BotConfig, broker: Broker, batch: list[dict]) -> str:
         for sym, pos in sorted(positions.items()):
             plpc = float(pos.unrealized_plpc or 0)
             mv = float(pos.market_value or 0)
-            opened = db.last_buy_ts(cfg.name, sym)
-            age = f"{(db.now() - opened).days}d" if opened else "?"
-            pos_lines.append(f"  - {sym}: ${mv:,.0f}, P/L {plpc:+.1%}, gehalten {age}")
+            meta = db.get_position_meta(cfg.name, sym)
+            opened = datetime.fromisoformat(meta["opened_at"]) if meta else db.last_buy_ts(cfg.name, sym)
+            age = f"{engine._trading_days(opened, db.now())} Handelstage" if opened else "?"
+            peak_txt = f", Peak {float(meta['peak_plpc']):+.1%}" if meta and float(meta["peak_plpc"] or 0) > 0 else ""
+            pos_lines.append(f"  - {sym}: ${mv:,.0f}, P/L {plpc:+.1%}{peak_txt}, gehalten {age}")
         header = f"Portfolio (Equity ${float(acct.equity):,.0f}, Cash ${float(acct.cash):,.0f}, {len(positions)}/{cfg.max_positions} Positionen):"
         sections.append(header + ("\n" + "\n".join(pos_lines) if pos_lines else " keine offenen Positionen"))
     except Exception:  # noqa: BLE001
@@ -84,15 +86,21 @@ def build_context(cfg: BotConfig, broker: Broker, batch: list[dict]) -> str:
 def fetch_and_analyze(cfg, broker: Broker, log: logging.Logger) -> None:
     items = SOURCES[cfg.name]()
     new = db.insert_items(cfg.name, items)
-    if not new:
-        log.info("Keine neuen Posts")
-        return
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cfg.max_item_age_hours)
-    fresh = [i for i in new if datetime.fromisoformat(i["created_utc"]) >= cutoff]
-    stale = [i["item_id"] for i in new if i not in fresh]
-    if stale:
-        db.mark_analyzed(cfg.name, stale, value=-1)  # zu alt, nicht auswerten
-    log.info("%d neue Posts (%d frisch, %d zu alt)", len(new), len(fresh), len(stale))
+    cutoff_iso = cutoff.isoformat()
+
+    # Ueberalterte oder inhaltsleere Posts (z.B. leere Medien-Posts, Paywall-Teaser) direkt als -1 markieren
+    db.mark_stale_unanalyzed(cfg.name, cutoff_iso)
+    junk = [i["item_id"] for i in new if sources.is_junk_item(cfg.name, i)]
+    if junk:
+        db.mark_analyzed(cfg.name, junk, value=-1)
+
+    # Alle frischen noch nicht analysierten Items holen (holt auch fehlgeschlagene LLM-Batches nach)
+    fresh = db.unanalyzed_items(cfg.name, cutoff_iso)
+    if not fresh:
+        log.info("Keine neuen analysierbaren Posts (neu=%d, uebersprungen=%d)", len(new), len(junk))
+        return
+    log.info("%d Posts zur Analyse (%d neu, %d uebersprungen)", len(fresh), len(new), len(junk))
 
     for k in range(0, len(fresh), BATCH):
         batch = fresh[k : k + BATCH]

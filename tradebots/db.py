@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT, ts TEXT, level TEXT, message TEXT
 );
+CREATE TABLE IF NOT EXISTS positions_meta (
+    bot TEXT NOT NULL, ticker TEXT NOT NULL,
+    opened_at TEXT NOT NULL, peak_plpc REAL DEFAULT 0.0, horizon_days INTEGER,
+    PRIMARY KEY (bot, ticker)
+);
 CREATE INDEX IF NOT EXISTS idx_signals_bot_status ON signals(bot, status);
 CREATE INDEX IF NOT EXISTS idx_snap_bot_ts ON snapshots(bot, ts);
 """
@@ -82,6 +87,27 @@ def insert_items(bot: str, items: list[dict]) -> list[dict]:
 def mark_analyzed(bot: str, item_ids: list[str], value: int = 1) -> None:
     with conn() as c:
         c.executemany("UPDATE items SET analyzed=? WHERE bot=? AND item_id=?", [(value, bot, i) for i in item_ids])
+
+
+def unanalyzed_items(bot: str, since_iso: str) -> list[dict]:
+    """Alle frischen noch nicht analysierten Items (holt auch fehlgeschlagene LLM-Batches nach)."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT item_id, created_utc, author, title, text, url FROM items "
+            "WHERE bot=? AND analyzed=0 AND created_utc >= ? ORDER BY created_utc ASC",
+            (bot, since_iso),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_stale_unanalyzed(bot: str, since_iso: str) -> int:
+    """Markiert ueberalterte analyzed=0 Items als -1, damit sie nicht ewig offen bleiben."""
+    with conn() as c:
+        cur = c.execute(
+            "UPDATE items SET analyzed=-1 WHERE bot=? AND analyzed=0 AND created_utc < ?",
+            (bot, since_iso),
+        )
+        return cur.rowcount
 
 
 def recent_items(bot: str, limit: int = 12, exclude_ids: set[str] | None = None) -> list[sqlite3.Row]:
@@ -166,3 +192,40 @@ def insert_snapshot(bot: str, equity: float, cash: float, positions_value: float
             "INSERT INTO snapshots(bot,ts,equity,cash,positions_value,n_positions) VALUES (?,?,?,?,?,?)",
             (bot, iso(), equity, cash, positions_value, n_positions),
         )
+
+
+# ---------- positions_meta (Peak & Horizont fuer Trailing-Stop / Zeit-Exit) ----------
+def upsert_position_meta(bot: str, ticker: str, opened_at: datetime, peak_plpc: float, horizon_days: int | None) -> None:
+    with conn() as c:
+        c.execute(
+            "INSERT INTO positions_meta(bot,ticker,opened_at,peak_plpc,horizon_days) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(bot,ticker) DO UPDATE SET peak_plpc=MAX(peak_plpc, excluded.peak_plpc), "
+            "horizon_days=COALESCE(excluded.horizon_days, horizon_days)",
+            (bot, ticker, iso(opened_at), peak_plpc, horizon_days),
+        )
+
+
+def get_position_meta(bot: str, ticker: str) -> sqlite3.Row | None:
+    with conn() as c:
+        return c.execute("SELECT * FROM positions_meta WHERE bot=? AND ticker=?", (bot, ticker)).fetchone()
+
+
+def update_position_peak(bot: str, ticker: str, peak_plpc: float) -> None:
+    with conn() as c:
+        c.execute(
+            "UPDATE positions_meta SET peak_plpc=? WHERE bot=? AND ticker=?",
+            (peak_plpc, bot, ticker),
+        )
+
+
+def delete_position_meta(bot: str, ticker: str) -> None:
+    with conn() as c:
+        c.execute("DELETE FROM positions_meta WHERE bot=? AND ticker=?", (bot, ticker))
+
+
+def prune_positions_meta(bot: str, open_tickers: set[str]) -> None:
+    with conn() as c:
+        rows = c.execute("SELECT ticker FROM positions_meta WHERE bot=?", (bot,)).fetchall()
+        stale = [(bot, r["ticker"]) for r in rows if r["ticker"] not in open_tickers]
+        if stale:
+            c.executemany("DELETE FROM positions_meta WHERE bot=? AND ticker=?", stale)

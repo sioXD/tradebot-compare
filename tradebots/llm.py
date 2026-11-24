@@ -20,30 +20,35 @@ are likely to move because of what the NEW POSTS say, over the next few days.
 Rules:
 - Base new signals on the NEW POSTS; use previous posts only to spot trends, escalations, or shifts in tone (do not re-trigger on old posts alone).
 - Use the current portfolio: if new posts turn bearish on a held position or invalidate its thesis, emit a "sell" signal. Avoid duplicate "buy" signals for positions already held.
-- Use recent market prices to avoid chasing tickers that already rallied heavily without a fresh catalyst.
+- Use recent market prices to avoid chasing tickers that already rallied heavily OR blindly catching falling knives that are actively crashing without a concrete positive catalyst.
 - Use only tickers that really exist on US exchanges. Use plain symbols (e.g. "AAPL", "GLD"). No options, no crypto pairs.
-- "buy" = expect price to rise. "sell" = expect price to fall (the bot will only exit/avoid, it does not short).
-- confidence is 0.0-1.0. Be conservative: most posts are noise; >0.8 only for very clear, strong signals.
-- horizon_days: expected holding period in trading days (1-30).
+- "buy" = expect price to rise. "sell" = expect price to fall (only exits held positions, no direct shorting). For clearly bearish market/index/bond views, you may instead emit a "buy" on liquid 1x inverse ETFs: SH (Short S&P 500), PSQ (Short Nasdaq-100), TBF (Short 20+Y Treasuries), DOG (Short Dow).
+- confidence is 0.0-1.0. Be conservative: most posts are noise; 0.65-0.71 = moderate (10% size), 0.72-0.79 = strong (15% size), >=0.80 = very clear high-conviction catalyst (20% size).
+- horizon_days: realistic expected holding period in TRADING days (2-5 for short-term momentum/news, 10-25 for macro trends). The engine uses this to exit stagnant positions.
 - reason: max. 25 words, in German, referencing the post(s).
 - If nothing is actionable, return an empty list.
-- Respond with ONLY a JSON object, no markdown: {"signals":[{"ticker":"...","action":"buy|sell","confidence":0.0,"horizon_days":3,"reason":"...","post_ids":["..."]}]}
+- Respond with ONLY a JSON object, no markdown: {"signals":[{"ticker":"...","action":"buy|sell","confidence":0.0,"horizon_days":5,"reason":"...","post_ids":["..."]}]}
 """
 
 SOURCE_HINTS = {
     "wsb": """Source: Reddit r/wallstreetbets. Either raw hot/rising posts (with score/comment counts) OR an aggregated
 snapshot of ticker mention counts (mentions now vs. 24h ago, upvotes, rank change).
-Focus on tickers with strong, broad community conviction (many upvotes/comments, multiple posts, sharply rising mentions).
-For mention snapshots: a strong surge in mentions/rank suggests short-term momentum (buy); a collapse in attention after a hype
-suggests fading (sell). Broad index ETFs (SPY, QQQ) are discussed constantly - only signal them on extreme changes.
-Ignore memes without a ticker, loss/gain porn without forward-looking view, and penny stocks under ~$2.""",
+CRITICAL WARNING FOR MENTION SNAPSHOTS: ApeWisdom counts ticker mentions WITHOUT sentiment! Crashes, panic, earnings misses,
+and jokes generate huge mention spikes just like rallies do.
+- NEVER emit a "buy" solely because mentions spiked on a falling stock (negative 1d/5d price action) — that is catching a falling knife! Require either positive/stabilizing price momentum OR an overwhelming, sustained breakout in both mentions and upvotes.
+- IGNORE ticker collisions with common English words or Reddit/options slang (e.g. HR, NYT, DTE/0DTE, ET, YOU, AI, ON, ALL, FOR, LOW, NOW, COST, OPEN, LOVE, REAL, DD). Only signal genuine, actively traded WSB stocks/ETFs.
+- Broad index ETFs (SPY, QQQ) are discussed constantly - only signal them on extreme changes.
+- Ignore memes without a ticker, loss/gain porn without forward-looking view, and penny stocks under ~$2.""",
     "truth": """Source: Truth Social posts by Donald J. Trump.
 Identify concrete market implications: named companies, sectors (tariffs, defense, energy, pharma, autos, chips, crypto),
-policy announcements. Map them to the most directly affected liquid US stocks or sector ETFs (e.g. XLE, ITA, SMH, XLV).
+policy announcements, or sharp market/oil/rate commentary. Map bullish impacts to liquid US stocks or sector ETFs (e.g. XLE, ITA, SMH, XLV)
+and clearly bearish broad-market/index views to 1x inverse ETFs (SH, PSQ, TBF) when appropriate.
 Ignore purely political posts without economic content.""",
     "armstrong": """Source: Martin Armstrong's blog (armstrongeconomics.com) - macro/cycle analysis.
 Translate macro views (equities, gold, bonds/interest rates, dollar, euro, oil, emerging markets) into positions in the
-ALLOWED UNIVERSE only. Longer horizons (5-30 days) are typical. Only signal when the post states a directional view.""",
+ALLOWED UNIVERSE only. Use 1x inverse ETFs (SH, PSQ, TBF, DOG) for clearly bearish equity/bond cycle calls.
+Prefer liquid ETFs with meaningful movement over ultra-flat currency proxies unless the macro catalyst is major.
+Longer horizons (10-25 trading days) are typical. Only signal when the post states a directional view.""",
 }
 
 
@@ -140,6 +145,8 @@ def analyze(bot: str, items: list[dict], universe: list[str], context: str = "")
         except (KeyError, ValueError, TypeError):
             continue
         if action not in ("buy", "sell") or not re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", ticker):
+            continue
+        if bot == "wsb" and ticker in config.WSB_BLACKLIST:
             continue
         if universe and ticker not in universe:
             continue
